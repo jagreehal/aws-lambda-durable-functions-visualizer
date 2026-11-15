@@ -1,0 +1,51 @@
+{
+  "name": "aws-lambda-durable-functions-visualizer",
+  "version": "0.1.0",
+  "description": "Visualize AWS Lambda Durable Functions workflows as Autovisualizer MachineJSON (or Mermaid). CLI and core library.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/jagreehal/aws-lambda-durable-functions-visualizer"
+  },
+  "homepage": "https://github.com/jagreehal/aws-lambda-durable-functions-visualizer",
+  "bugs": {
+    "url": "https://github.com/jagreehal/aws-lambda-durable-functions-visualizer/issues"
+  },
+  "keywords": [
+    "aws",
+    "lambda",
+    "durable-functions",
+    "workflow",
+    "visualization",
+    "autovisualizer",
+    "xstate",
+    "machinejson",
+    "mermaid",
+    "serverless"
+  ],
+  "bin": {
+    "aws-lambda-durable-functions-visualizer": "dist/bin.cjs",
+    "ldfviz": "dist/bin.cjs"
+  },
+  "files": [
+    "dist/bin.cjs",
+    "README.md",
+    "LICENSE",
+    "CHANGELOG.md"
+  ],
+  "scripts": {
+    "build": "esbuild src/bin.ts --bundle --outfile=dist/bin.cjs --format=cjs --platform=node --banner:js='#!/usr/bin/env node'",
+    "lint": "eslint src",
+    "check-types": "tsc --noEmit -p ."
+  },
+  "devDependencies": {
+    "@types/node": "^25.5.0",
+    "commander": "^13.0.0",
+    "esbuild": "^0.25.0",
+    "typescript": "^5.8.0",
+    "@ldfviz/core": "workspace:*"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

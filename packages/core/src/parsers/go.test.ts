@@ -1,0 +1,464 @@
+import { describe, it } from 'node:test'
+import assert from 'node:assert/strict'
+import { resolve } from 'node:path'
+import { GoParser } from './go.js'
+import { parseFile } from '../parser.js'
+import type { WorkflowNode } from '../graph.js'
+
+const parser = new GoParser()
+const examplesDir = resolve(import.meta.dirname, '../../../..', 'examples')
+const fixturesDir = resolve(import.meta.dirname, '../../../..', 'packages/core/test-fixtures')
+
+describe('GoParser', () => {
+  it('parses the order_workflow example', () => {
+    const graph = parser.parseFile(resolve(examplesDir, 'order_workflow.go'))
+
+    assert.equal(graph.name, 'order_workflow')
+
+    const kinds = graph.nodes.map((n) => n.kind)
+    assert.ok(kinds.includes('start'))
+    assert.ok(kinds.includes('end'))
+    assert.ok(kinds.includes('step'))
+    assert.ok(kinds.includes('parallel'))
+    assert.ok(kinds.includes('wait'))
+    assert.ok(kinds.includes('waitForCallback'))
+    assert.ok(kinds.includes('condition'))
+  })
+
+  it('extracts step names from the call arguments', () => {
+    const graph = parser.parseFile(resolve(examplesDir, 'order_workflow.go'))
+
+    const stepLabels = graph.nodes.filter((n) => n.kind === 'step').map((n) => n.label)
+    assert.ok(stepLabels.includes('validate-order'))
+    assert.equal(stepLabels.length, 1)
+  })
+
+  it('extracts parallel branch names', () => {
+    const graph = parser.parseFile(resolve(examplesDir, 'order_workflow.go'))
+
+    const parallel = graph.nodes.find((n) => n.kind === 'parallel')
+    assert.ok(parallel)
+    assert.equal(parallel.label, 'prepare-shipment')
+    assert.ok(parallel.branches)
+    assert.equal(parallel.branches.length, 2)
+
+    const branchNames = parallel.branches.map((b) => b.name)
+    assert.ok(branchNames.includes('generate-label'))
+    assert.ok(branchNames.includes('generate-tracking'))
+  })
+
+  it('extracts the wait name and duration', () => {
+    const graph = parser.parseFile(resolve(examplesDir, 'order_workflow.go'))
+
+    const wait = graph.nodes.find((n) => n.kind === 'wait')
+    assert.ok(wait)
+    assert.equal(wait.label, 'cooling-off')
+    assert.equal(wait.timeout, '5*time.Second')
+  })
+
+  it('detects the condition wrapping the callback', () => {
+    const graph = parser.parseFile(resolve(examplesDir, 'order_workflow.go'))
+
+    const condition = graph.nodes.find((n) => n.kind === 'condition')
+    assert.ok(condition)
+    assert.equal(condition.condition, 'event.RequireApproval')
+    assert.equal(condition.thenCount, 1)
+  })
+
+  it('does not treat error-handling if statements as conditions', () => {
+    const graph = parser.parseFile(resolve(examplesDir, 'order_workflow.go'))
+
+    const conditions = graph.nodes.filter((n) => n.kind === 'condition')
+    assert.equal(conditions.length, 1)
+    assert.equal(conditions[0].condition, 'event.RequireApproval')
+  })
+
+  it('parses the order_workflow_config example', () => {
+    const graph = parser.parseFile(resolve(examplesDir, 'order_workflow_config.go'))
+
+    assert.equal(graph.name, 'order_workflow_config')
+
+    const kinds = graph.nodes.map((n) => n.kind)
+    for (const kind of ['step', 'invoke', 'map', 'runInChildContext', 'withRetry', 'waitForCondition', 'promiseAll', 'promiseAny', 'promiseRace', 'promiseAllSettled']) {
+      assert.ok((kinds as string[]).includes(kind), `expected kind ${kind}`)
+    }
+  })
+
+  it('extracts step retry strategy and semantics', () => {
+    const graph = parser.parseFile(resolve(examplesDir, 'order_workflow_config.go'))
+
+    const step = graph.nodes.find((n) => n.kind === 'step' && n.label === 'charge-payment')
+    assert.ok(step)
+    assert.equal(step.retryStrategy, 'ExponentialBackoff')
+    assert.equal(step.stepSemantics, 'AtMostOncePerRetry')
+  })
+
+  it('extracts invoke target and tenant id', () => {
+    const graph = parser.parseFile(resolve(examplesDir, 'order_workflow_config.go'))
+
+    const invoke = graph.nodes.find((n) => n.kind === 'invoke' && n.label === 'notify-customer')
+    assert.ok(invoke)
+    assert.equal(invoke.target, 'notify-fn:$LATEST')
+    assert.equal(invoke.tenantId, 'tenant-001')
+  })
+
+  it('extracts map concurrency, completion config, and inner branch nodes', () => {
+    const graph = parser.parseFile(resolve(examplesDir, 'order_workflow_config.go'))
+
+    const map = graph.nodes.find((n) => n.kind === 'map')
+    assert.ok(map)
+    assert.equal(map.label, 'reserve-inventory')
+    assert.equal(map.maxConcurrency, 4)
+    assert.equal(map.completionConfig, 'minSuccessful:1 toleratedFailures:2')
+    assert.ok(map.branches?.length)
+    assert.equal(map.branches[0].nodes[0].label, 'reserve-item')
+  })
+
+  it('extracts the flat child context', () => {
+    const graph = parser.parseFile(resolve(examplesDir, 'order_workflow_config.go'))
+
+    const child = graph.nodes.find((n) => n.kind === 'runInChildContext')
+    assert.ok(child)
+    assert.equal(child.label, 'settlement')
+    assert.equal(child.nestingType, 'FLAT')
+  })
+
+  it('extracts the withRetry strategy', () => {
+    const graph = parser.parseFile(resolve(examplesDir, 'order_workflow_config.go'))
+
+    const retry = graph.nodes.find((n) => n.kind === 'withRetry')
+    assert.ok(retry)
+    assert.equal(retry.label, 'flaky-sync')
+    assert.equal(retry.retryStrategy, 'MustLinearBackoff')
+  })
+
+  it('maps concurrency combinators to promise kinds', () => {
+    const graph = parser.parseFile(resolve(examplesDir, 'order_workflow_config.go'))
+
+    const labelFor = (kind: string) => graph.nodes.find((n) => n.kind === kind)?.label
+    assert.equal(labelFor('promiseAll'), 'await-all')
+    assert.equal(labelFor('promiseAny'), 'await-any')
+    assert.equal(labelFor('promiseRace'), 'await-race')
+    assert.equal(labelFor('promiseAllSettled'), 'await-settled')
+  })
+
+  it('does not duplicate nested durable calls as top-level nodes', () => {
+    const graph = parser.parseFile(resolve(examplesDir, 'order_workflow_config.go'))
+
+    // The map callback and the child context each contain one inner step; they
+    // must belong to the map branch / be skipped, not appear at top level.
+    const topLevelStepLabels = graph.nodes.filter((n) => n.kind === 'step').map((n) => n.label)
+    assert.ok(!topLevelStepLabels.includes('reserve-item'))
+    assert.ok(!topLevelStepLabels.includes('close-ledger'))
+  })
+
+  it('follows same-file helper functions that accept a durable Context', () => {
+    const graph = parser.parseFile(resolve(fixturesDir, 'go_helpers.go'))
+
+    const stepLabels = graph.nodes.filter((n) => n.kind === 'step').map((n) => n.label)
+    assert.ok(stepLabels.includes('validate'))
+    assert.ok(stepLabels.includes('dynamic-step'))
+  })
+
+  it('resolves a local string constant as a step name', () => {
+    const graph = parser.parseFile(resolve(fixturesDir, 'go_helpers.go'))
+
+    const step = graph.nodes.find((n) => n.kind === 'step' && n.label === 'dynamic-step')
+    assert.ok(step)
+  })
+
+  it('parses an inline function passed to durable.Wrap', () => {
+    const graph = parser.parseFile(resolve(fixturesDir, 'go_inline.go'))
+
+    const step = graph.nodes.find((n) => n.kind === 'step')
+    assert.ok(step)
+    assert.equal(step.label, 'inline-step')
+  })
+
+  it('parses CreateCallback, Go, Join, and Select', () => {
+    const graph = parser.parseFile(resolve(fixturesDir, 'go_misc.go'))
+
+    const kinds = graph.nodes.map((n) => n.kind)
+    assert.ok(kinds.includes('createCallback'))
+    assert.ok(kinds.includes('runInChildContext'))
+    assert.ok(kinds.includes('promiseAll'))
+    assert.ok(kinds.includes('promiseRace'))
+
+    const createCb = graph.nodes.find((n) => n.kind === 'createCallback')
+    assert.equal(createCb?.label, 'external-callback')
+    const go_ = graph.nodes.find((n) => n.kind === 'runInChildContext')
+    assert.equal(go_?.label, 'background')
+  })
+
+  it('ignores durable-looking text in comments, strings, and runes', () => {
+    const graph = parser.parseFile(resolve(fixturesDir, 'go_formatting.go'))
+
+    const labels = graph.nodes.map((n) => n.label)
+    assert.ok(!labels.includes('commented-out'), 'line comment must be ignored')
+    assert.ok(!labels.includes('in-a-block-comment'), 'block comment must be ignored')
+    assert.ok(!labels.includes('in-a-string'), 'string literal must be ignored')
+  })
+
+  it('handles nested generic type arguments', () => {
+    const graph = parser.parseFile(resolve(fixturesDir, 'go_formatting.go'))
+
+    const invoke = graph.nodes.find((n) => n.kind === 'invoke')
+    assert.ok(invoke)
+    assert.equal(invoke.label, 'nested-generics')
+    assert.equal(invoke.target, 'target-fn:$LATEST')
+  })
+
+  it('keeps a brace inside a condition string literal', () => {
+    const graph = parser.parseFile(resolve(fixturesDir, 'go_formatting.go'))
+
+    const condition = graph.nodes.find((n) => n.kind === 'condition')
+    assert.ok(condition)
+    assert.equal(condition.condition, 'event.Note != "}"')
+
+    const guarded = graph.nodes.find((n) => n.kind === 'step' && n.label === 'guarded')
+    assert.ok(guarded, 'the step inside the condition should be detected')
+  })
+
+  it('throws when there is no durable entry point', () => {
+    assert.throws(() => parser.parseFile(resolve(fixturesDir, 'go_no_entry.go')), /No durable\.Start\(\) entry point/)
+  })
+
+  it('is selected by parseFile for .go files', () => {
+    const graph = parseFile(resolve(examplesDir, 'order_workflow.go'))
+    assert.equal(graph.name, 'order_workflow')
+  })
+
+  describe('loops', () => {
+    const graph = parser.parseFile(resolve(fixturesDir, 'go_loops.go'))
+    const loops = graph.nodes.filter((n) => n.kind === 'loop')
+
+    it('should emit a loop node for each loop that wraps durable calls', () => {
+      assert.deepEqual(loops.map((n) => n.loopHeader), [
+        '_, order := range event.Orders',
+        'attempt := 0; attempt < 3; attempt++',
+        'range 2',
+        '_, region := range []string{"us", "eu"}',
+        '',
+      ])
+    })
+
+    it('should not emit a loop node when the body has no durable calls', () => {
+      assert.ok(!graph.nodes.some((n) => n.loopHeader?.includes('ignored')))
+    })
+
+    it('should include a nested condition and its branch in the body count', () => {
+      const orderLoop = loops[0]
+      const index = graph.nodes.indexOf(orderLoop)
+      const body = graph.nodes.slice(index + 1, index + 1 + (orderLoop.bodyCount ?? 0))
+
+      assert.deepEqual(body.map((n) => n.label), ['validate', 'order == "vip"', 'vip-perk', 'charge'])
+    })
+
+    it('should detect literal iteration counts', () => {
+      assert.equal(loops[1].iterations, 3)
+      assert.equal(loops[2].iterations, 2)
+      assert.equal(loops[0].iterations, undefined)
+    })
+
+    it('should use the trailing brace so composite literals in the header do not cut it short', () => {
+      const regionLoop = loops[3]
+      const index = graph.nodes.indexOf(regionLoop)
+
+      assert.equal(regionLoop.bodyCount, 1)
+      assert.equal(graph.nodes[index + 1].label, 'per-region')
+    })
+
+    it('should label a bare for loop as a plain loop', () => {
+      assert.equal(loops[4].label, 'loop')
+    })
+
+    it('should keep steps after the loops in order', () => {
+      const labels = graph.nodes.filter((n) => n.kind === 'step').map((n) => n.label)
+      assert.equal(labels[labels.length - 1], 'finish')
+    })
+
+    it('should connect each loop with a back-edge and a done edge', () => {
+      for (const loop of loops) {
+        assert.ok(graph.edges.some((e) => e.to === loop.id && e.style === 'back'))
+        assert.equal(graph.edges.filter((e) => e.from === loop.id && e.label === 'done').length, 1)
+      }
+    })
+
+    it('should report the source line of the loop and of the steps inside it', () => {
+      const orderLoop = loops[0]
+      const validate = graph.nodes.find((n) => n.label === 'validate')!
+
+      const perk = graph.nodes.find((n) => n.label === 'vip-perk')!
+      const charge = graph.nodes.find((n) => n.label === 'charge')!
+
+      assert.equal(orderLoop.sourceLine, 18)
+      assert.equal(validate.sourceLine, 19)
+      assert.equal(perk.sourceLine, 23)
+      assert.equal(charge.sourceLine, 27)
+    })
+  })
+
+  it('should not skip the statement that directly follows an if block', () => {
+    const graph = parser.parseFile(resolve(fixturesDir, 'go_if_then_step.go'))
+
+    assert.deepEqual(graph.nodes.map((n) => n.label), ['Start', 'event == "vip"', 'vip-perk', 'charge', 'End'])
+  })
+
+  it('keeps the structure of inline branch callbacks', () => {
+    const graph = parser.parseFile(resolve(fixturesDir, 'go_nested_parallel.go'))
+    const outer = graph.nodes.find((n) => n.label === 'outer')!
+    // The nested Parallel's branch literals must not become outer branches
+    assert.deepEqual(outer.branches!.map((b) => b.name), ['nested', 'gated'])
+    const [nested, gated] = outer.branches!
+
+    assert.deepEqual(nested.nodes.map((n) => [n.kind, n.label]), [['parallel', 'inner'], ['step', 'tail']])
+    assert.deepEqual(nested.nodes[0].branches!.map((b) => [b.name, b.nodes.map((n) => n.label)]), [['a', ['a']], ['b', ['b']]])
+    assert.deepEqual(gated.nodes.map((n) => [n.kind, n.label]), [['invoke', 'first'], ['condition', 'event.VIP'], ['step', 'vip']])
+
+    const all = (nodes: WorkflowNode[]): WorkflowNode[] =>
+      nodes.flatMap((n) => [n, ...all((n.branches ?? []).flatMap((b) => b.nodes))])
+    const node = (label: string) => all(graph.nodes).find((n) => n.label === label)!
+    assert.deepEqual(['inner', 'a', 'tail', 'first', 'event.VIP', 'vip', 'after'].map((l) => node(l).sourceLine), [16, 18, 26, 34, 37, 38, 52])
+
+    const edge = (from: string, to: string) => graph.edges.some((e) => e.from === node(from).id && e.to === node(to).id)
+    assert.ok(edge('a', 'tail'), 'inner branches join at tail')
+    assert.ok(edge('b', 'tail'), 'inner branches join at tail')
+    assert.ok(edge('tail', 'after'), 'outer branch joins at after')
+    assert.ok(edge('event.VIP', 'after'), 'skipped condition leaves the branch')
+  })
+
+  it('resolves branch slices and callbacks declared in variables', () => {
+    const graph = parser.parseFile(resolve(fixturesDir, 'go_branch_vars.go'))
+
+    // Declared durable calls appear only inside their parallel/map, not where declared
+    assert.deepEqual(graph.nodes.map((n) => [n.kind, n.label]), [
+      ['start', 'Start'], ['parallel', 'ship'], ['parallel', 'after-ship'], ['map', 'reserve'], ['step', 'done'], ['end', 'End'],
+    ])
+    const branchesOf = (label: string) =>
+      graph.nodes.find((n) => n.label === label)!.branches!.map((b) => [b.name, b.nodes.map((n) => [n.label, n.sourceLine])])
+    assert.deepEqual(branchesOf('ship'), [
+      ['make-label', [['label', 17]]],
+      ['pack-box', [['pack', 10]]],
+      ['track', [['tracking', 24]]],
+    ])
+    assert.deepEqual(branchesOf('after-ship'), [['notify', [['notify', 34]]]])
+    assert.deepEqual(branchesOf('reserve'), [['each item', [['reserve-item', 42]]]])
+  })
+
+  it('resolves appended, looped, captured and method branches by scope', () => {
+    const graph = parser.parseFile(resolve(fixturesDir, 'go_branch_scope.go'))
+    const node = (label: string) => graph.nodes.find((n) => n.label === label)!
+    const shape = (n: WorkflowNode) => n.branches?.map((b) => [b.name, b.dynamic, b.nodes.map((c) => c.label)])
+
+    assert.deepEqual(graph.nodes.map((n) => n.label), ['Start', 'fan-out', 'outer', 'local', 'report', 'done', 'End'])
+    // Declaration, then append in order, then an append in a range loop
+    assert.deepEqual(shape(node('fan-out')), [
+      ['mail', false, ['mail']],
+      ['print', false, ['print']],
+      ['each item', true, ['ship-region']],
+    ])
+    const loopStep = node('fan-out').branches![2].nodes[0]
+    assert.equal(loopStep.sourceLine, 43)
+    // Select over a slice from the enclosing function, captured by a func literal
+    const race = node('outer').branches![0].nodes
+    assert.deepEqual(race.map((n) => [n.kind, n.label]), [['condition', 'event.Race'], ['promiseRace', 'pick']])
+    assert.deepEqual(shape(race[1]), [['fast', false, ['fast-path']], ['slow', false, ['slow-path']]])
+    assert.deepEqual(shape(node('local')), [['local-only', false, ['local']]])
+    // report uses the package-level `fallback`, not the handler's local one
+    assert.equal(node('report').branches, undefined)
+  })
+
+  it('extracts Select branches written inline', () => {
+    const graph = parser.parseFile(resolve(fixturesDir, 'go_misc.go'))
+    const select = graph.nodes.find((n) => n.kind === 'promiseRace')!
+    assert.deepEqual(select.branches!.map((b) => b.name), ['primary', 'secondary'])
+  })
+
+  it('draws child context, Go and Retry callbacks inside their node', () => {
+    const graph = parser.parseFile(resolve(fixturesDir, 'go_child_context.go'))
+    const node = (label: string) => graph.nodes.find((n) => n.label === label)!
+    const inner = (label: string) => node(label).branches?.map((b) => [b.name, b.nodes.map((n) => [n.label, n.sourceLine])])
+
+    // Inner calls are not repeated at the top level; the invoked func literal runs in place
+    assert.deepEqual(graph.nodes.map((n) => n.label), ['Start', 'validate', 'background', 'idle', 'join', 'charge', 'in-place', 'End'])
+    assert.deepEqual(inner('validate'), [['validate', [['check-stock', 15], ['settle', 18]]]])
+    assert.deepEqual(inner('background'), [['background', [['bg-step', 24]]]])
+    assert.equal(node('idle').branches, undefined, 'nothing durable inside: no branches')
+    // Retry through a function reference
+    assert.deepEqual(inner('charge'), [['charge', [['charge-card', 10]]]])
+
+    const id = (label: string) => [...graph.nodes, ...graph.nodes.flatMap((n) => n.branches?.[0]?.nodes ?? [])].find((n) => n.label === label)!.id
+    const edge = (from: string, to: string) => graph.edges.some((e) => e.from === id(from) && e.to === id(to))
+    assert.ok(edge('validate', 'check-stock'))
+    assert.ok(edge('settle', 'background'))
+  })
+
+  it('extracts NewTypedBranch variables and branch factory calls', () => {
+    const graph = parser.parseFile(resolve(fixturesDir, 'go_branch_factory.go'))
+    const shape = (label: string) =>
+      graph.nodes.find((n) => n.label === label)!.branches!.map((b) => [b.name, b.nodes.map((n) => [n.label, n.sourceLine])])
+
+    assert.deepEqual(graph.nodes.map((n) => n.label), ['Start', 'mixed', 'made', 'End'])
+    assert.deepEqual(shape('mixed'), [['compute', [['compute-value', 11]]], ['timer', [['short-timer', 14]]]])
+    // Name comes from the factory's argument; the body from its returned literal
+    assert.deepEqual(shape('made'), [['a', [['fill', 22]]], ['b', [['fill', 22]]]])
+  })
+
+  it('draws else and else-if branches', () => {
+    const graph = parser.parseFile(resolve(fixturesDir, 'go_if_else.go'))
+    const node = (label: string) => graph.nodes.find((n) => n.label === label)!
+    const id = (label: string) => node(label).id
+    const edges = new Set(graph.edges.map((e) => `${e.from}>${e.to}${e.label ? ':' + e.label : ''}`))
+    const has = (from: string, to: string, label?: string) =>
+      assert.ok(edges.has(`${id(from)}>${id(to)}${label ? ':' + label : ''}`), `${from} -> ${to} ${label ?? ''}`)
+
+    // if / else: both sides join at the next condition
+    has('event.VIP', 'fast-track', 'yes')
+    has('event.VIP', 'queue', 'no')
+    has('fast-track', 'event.Tier == "gold"')
+    has('notify-wait', 'event.Tier == "gold"')
+    // else-if chain: the last else returns, so it ends the workflow
+    has('event.Tier == "gold"', 'event.Tier == "silver"', 'no')
+    has('gold', '!(event.Skip)')
+    has('silver', '!(event.Skip)')
+    has('bronze', 'End')
+    // only the else side is durable: the condition is negated
+    has('!(event.Skip)', 'only-else', 'yes')
+    const loop = graph.nodes.find((n) => n.kind === 'loop')!
+    assert.ok(edges.has(`${id('!(event.Skip)')}>${loop.id}:no`))
+    // a loop body counts the else side too, and both sides go round again
+    assert.equal(loop.bodyCount, 3)
+    has('i == 0', 'later', 'no')
+    assert.ok(edges.has(`${id('later')}>${loop.id}:next`))
+    assert.deepEqual(['queue', 'silver', 'bronze'].map((l) => node(l).sourceLine), [18, 25, 27])
+  })
+
+  it('draws if statements with an init statement', () => {
+    const graph = parser.parseFile(resolve(fixturesDir, 'go_if_init.go'))
+    const node = (label: string) => graph.nodes.find((n) => n.label === label)!
+    const id = (label: string) => node(label).id
+    const edges = new Set(graph.edges.map((e) => `${e.from}>${e.to}${e.label ? ':' + e.label : ''}`))
+    const has = (from: string, to: string, label?: string) =>
+      assert.ok(edges.has(`${id(from)}>${id(to)}${label ? ':' + label : ''}`), `${from} -> ${to} ${label ?? ''}`)
+
+    // The init's durable call runs before the condition, labelled after the last `;`
+    assert.deepEqual(graph.nodes.map((n) => n.label), [
+      'Start', 'charge', 'err != nil', 'refund', 'receipt',
+      'tier == "gold"', 'gold', 'n > 3', 'long-tier', 'lookup', 'err == nil && v != ""', 'found',
+      'pause', 'finish', 'End',
+    ])
+    has('charge', 'err != nil')
+    has('err != nil', 'refund', 'yes')
+    has('err != nil', 'receipt', 'no')
+    has('receipt', 'End')
+    has('refund', 'tier == "gold"')
+    // else-if chain with inits: the nested init call sits on the else side
+    has('tier == "gold"', 'n > 3', 'no')
+    has('n > 3', 'lookup', 'no')
+    has('lookup', 'err == nil && v != ""')
+    has('err == nil && v != ""', 'pause', 'no')
+    has('gold', 'pause')
+    assert.equal(node('n > 3').elseCount, 3)
+    assert.equal(node('charge').sourceLine, 15)
+  })
+})

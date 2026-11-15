@@ -1,0 +1,12 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "outDir": "dist",
+    "rootDir": "src",
+    // esbuild bundles the CLI, so resolve imports the way a bundler does
+    "module": "preserve",
+    "moduleResolution": "bundler",
+    "resolveJsonModule": true
+  },
+  "include": ["src"]
+}

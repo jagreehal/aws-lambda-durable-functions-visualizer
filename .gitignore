@@ -1,0 +1,11 @@
+node_modules/
+dist/
+*.tsbuildinfo
+*.vsix
+*.log
+.DS_Store
+.aws-sam
+.tmp/
+test-results/
+playwright-report/
+.claude/settings.local.json

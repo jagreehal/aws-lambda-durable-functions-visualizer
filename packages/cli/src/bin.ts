@@ -1,0 +1,538 @@
+import { Command } from 'commander'
+import { resolve, basename, extname } from 'node:path'
+import { tmpdir } from 'node:os'
+import { writeFileSync, readFileSync } from 'node:fs'
+import { exec, execSync } from 'node:child_process'
+import { parseFile, renderMermaid, renderMachineJsonString } from '@ldfviz/core'
+import { version } from '../package.json'
+
+function isWSL(): boolean {
+  try {
+    const release = readFileSync('/proc/version', 'utf-8')
+    return /microsoft|wsl/i.test(release)
+  } catch {
+    return false
+  }
+}
+
+/** Get a temp directory that the host OS can open (Windows-side on WSL). */
+function getTempDir(): string {
+  if (isWSL()) {
+    try {
+      const winTemp = execSync('cmd.exe /c echo %TEMP%', { stdio: ['pipe', 'pipe', 'ignore'] })
+        .toString().trim()
+      return execSync(`wslpath ${JSON.stringify(winTemp)}`).toString().trim()
+    } catch {
+      return tmpdir()
+    }
+  }
+  return tmpdir()
+}
+
+const escapeHtml = (text: string) => text.replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`)
+/** JSON that can sit inside a <script> element without closing it. */
+const scriptJson = (json: string) => json.replace(/</g, '\\u003c').replace(/>/g, '\\u003e')
+
+function openInBrowser(filePath: string): void {
+  // BROWSER=none writes the page without launching anything (CI, tests, remote shells)
+  if (process.env.BROWSER === 'none') return
+  const platform = process.platform
+  if (isWSL()) {
+    const winPath = execSync(`wslpath -w ${JSON.stringify(filePath)}`).toString().trim()
+    exec(`cmd.exe /c start "" "${winPath}"`)
+  } else if (platform === 'darwin') {
+    exec(`open ${JSON.stringify(filePath)}`)
+  } else if (platform === 'win32') {
+    exec(`start "" ${JSON.stringify(filePath)}`)
+  } else {
+    exec(`xdg-open ${JSON.stringify(filePath)}`)
+  }
+}
+
+function buildHtml(mermaid: string, title: string, graphJson: string): string {
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>${escapeHtml(title)} - AWS Lambda Durable Functions Visualizer</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: #0f172a;
+      color: #e2e8f0;
+      display: flex;
+      flex-direction: column;
+      height: 100vh;
+      overflow: hidden;
+    }
+    header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 1rem 1.5rem;
+      border-bottom: 1px solid #1e293b;
+      flex-shrink: 0;
+    }
+    h1 {
+      font-size: 1.1rem;
+      font-weight: 500;
+      color: #94a3b8;
+    }
+    h1 span { color: #e2e8f0; }
+    .controls {
+      display: flex;
+      gap: 0.5rem;
+      align-items: center;
+    }
+    .controls button {
+      background: #1e293b;
+      border: 1px solid #334155;
+      color: #e2e8f0;
+      padding: 0.3rem 0.7rem;
+      border-radius: 6px;
+      cursor: pointer;
+      font-size: 0.9rem;
+    }
+    .controls button:hover { background: #334155; }
+    .controls span { color: #64748b; font-size: 0.8rem; }
+    .diagram-container {
+      flex: 1;
+      overflow: hidden;
+      position: relative;
+      cursor: grab;
+    }
+    .diagram-container.dragging { cursor: grabbing; }
+    .diagram-wrapper {
+      position: absolute;
+      transform-origin: 0 0;
+      opacity: 0;
+      transition: opacity 0.3s ease;
+    }
+    .diagram-wrapper.ready { opacity: 1; }
+    .mermaid svg {
+      max-width: none !important;
+      height: auto !important;
+    }
+    .mermaid .node .label { padding: 8px 12px; }
+    footer {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      border-top: 1px solid #1e293b;
+      flex-shrink: 0;
+      padding: 0.5rem 1.5rem;
+    }
+    .legend {
+      display: flex;
+      gap: 1.5rem;
+      flex-wrap: wrap;
+      font-size: 0.75rem;
+      color: #64748b;
+    }
+    footer a {
+      color: #64748b;
+      font-size: 0.75rem;
+      text-decoration: none;
+    }
+    footer a:hover { color: #94a3b8; }
+    .legend-item {
+      display: flex;
+      align-items: center;
+      gap: 0.35rem;
+    }
+    .legend-swatch {
+      width: 12px;
+      height: 12px;
+      border-radius: 3px;
+    }
+    .source-panel {
+      display: none;
+      position: absolute;
+      inset: 0;
+      background: #0f172a;
+      z-index: 10;
+      flex-direction: column;
+    }
+    .source-panel.visible { display: flex; }
+    .source-tabs {
+      display: flex;
+      gap: 0;
+      border-bottom: 1px solid #1e293b;
+      flex-shrink: 0;
+    }
+    .source-tabs button {
+      background: none;
+      border: none;
+      color: #64748b;
+      padding: 0.5rem 1rem;
+      cursor: pointer;
+      font-size: 0.8rem;
+      border-bottom: 2px solid transparent;
+    }
+    .source-tabs button.active { color: #e2e8f0; border-bottom-color: #e2e8f0; }
+    .source-content {
+      flex: 1;
+      overflow: auto;
+      padding: 1rem;
+      font-family: monospace;
+      font-size: 0.8rem;
+      white-space: pre;
+      color: #e2e8f0;
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>ldfviz: <span>${escapeHtml(title)}</span></h1>
+    <div class="controls">
+      <button id="zoom-out">-</button>
+      <span id="zoom-level">100%</span>
+      <button id="zoom-in">+</button>
+      <button id="zoom-fit">Fit</button>
+      <button id="toggle-direction">LR</button>
+      <button id="download-png">Save PNG</button>
+      <button id="toggle-source">Source</button>
+    </div>
+  </header>
+  <div class="diagram-container" id="container">
+    <div class="diagram-wrapper" id="wrapper">
+      <pre class="mermaid">
+${mermaid}
+      </pre>
+    </div>
+    <div class="source-panel" id="source-panel">
+      <div class="source-tabs">
+        <button class="active" data-tab="mermaid">Mermaid</button>
+        <button data-tab="json">JSON</button>
+      </div>
+      <div class="source-content" id="source-content"></div>
+    </div>
+  </div>
+  <footer>
+    <div class="legend">
+      <div class="legend-item"><div class="legend-swatch" style="background:#5b8ab4"></div> Start / End</div>
+      <div class="legend-item"><div class="legend-swatch" style="background:#4a8c72"></div> Step</div>
+      <div class="legend-item"><div class="legend-swatch" style="background:#b8873a"></div> Invoke</div>
+      <div class="legend-item"><div class="legend-swatch" style="background:#7b6b9e"></div> Parallel / Map</div>
+      <div class="legend-item"><div class="legend-swatch" style="background:#b05a5a"></div> Wait / Callback</div>
+      <div class="legend-item"><div class="legend-swatch" style="background:#6b71a8"></div> Condition</div>
+<div class="legend-item"><div class="legend-swatch" style="background:#7d8a3e"></div> Loop</div>
+      <div class="legend-item"><div class="legend-swatch" style="background:#4a849e"></div> Child Context</div>
+    </div>
+    <a href="https://github.com/jagreehal/aws-lambda-durable-functions-visualizer" target="_blank">AWS Lambda Durable Functions Visualizer</a>
+  </footer>
+  <script type="application/json" id="graph-json">${scriptJson(graphJson)}</script>
+  <script type="module">
+    import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
+    mermaid.initialize({
+      startOnLoad: true,
+      theme: 'dark',
+      flowchart: { curve: 'basis', padding: 15, nodeSpacing: 30, rankSpacing: 40 },
+      themeVariables: { nodePadding: 12 },
+    });
+
+    const wrapper = document.getElementById('wrapper');
+    const zoomLabel = document.getElementById('zoom-level');
+    const container = document.getElementById('container');
+
+    let mermaidRaw = document.querySelector('.mermaid').textContent.trim();
+    let scale = 1;
+    let panX = 0;
+    let panY = 0;
+    let isDragging = false;
+    let dragStartX = 0;
+    let dragStartY = 0;
+    let panStartX = 0;
+    let panStartY = 0;
+
+    function applyTransform() {
+      wrapper.style.transform = 'translate(' + panX + 'px, ' + panY + 'px) scale(' + scale + ')';
+      zoomLabel.textContent = Math.round(scale * 100) + '%';
+    }
+
+    function setZoom(newScale, cx, cy) {
+      newScale = Math.max(0.1, Math.min(5, newScale));
+      if (cx !== undefined && cy !== undefined) {
+        panX = cx - (cx - panX) * (newScale / scale);
+        panY = cy - (cy - panY) * (newScale / scale);
+      }
+      scale = newScale;
+      applyTransform();
+    }
+
+    function fitToView() {
+      const svg = wrapper.querySelector('svg');
+      if (!svg) return;
+      const cw = container.clientWidth;
+      const ch = container.clientHeight;
+      const sw = svg.clientWidth || svg.getBoundingClientRect().width;
+      const sh = svg.clientHeight || svg.getBoundingClientRect().height;
+      if (!sw || !sh) return;
+      const fitScale = Math.min(cw / sw, ch / sh) * 0.85;
+      scale = fitScale;
+      panX = (cw - sw * scale) / 2;
+      panY = (ch - sh * scale) / 2;
+      applyTransform();
+    }
+
+    container.addEventListener('wheel', (e) => {
+      e.preventDefault();
+      const rect = container.getBoundingClientRect();
+      const cx = e.clientX - rect.left;
+      const cy = e.clientY - rect.top;
+      const delta = e.deltaY < 0 ? 1.15 : 1 / 1.15;
+      setZoom(scale * delta, cx, cy);
+    }, { passive: false });
+
+    container.addEventListener('mousedown', (e) => {
+      if (e.button !== 0) return;
+      isDragging = true;
+      dragStartX = e.clientX;
+      dragStartY = e.clientY;
+      panStartX = panX;
+      panStartY = panY;
+      container.classList.add('dragging');
+    });
+
+    window.addEventListener('mousemove', (e) => {
+      if (!isDragging) return;
+      panX = panStartX + (e.clientX - dragStartX);
+      panY = panStartY + (e.clientY - dragStartY);
+      applyTransform();
+    });
+
+    window.addEventListener('mouseup', () => {
+      isDragging = false;
+      container.classList.remove('dragging');
+    });
+
+    document.getElementById('zoom-in').onclick = () => {
+      const rect = container.getBoundingClientRect();
+      setZoom(scale * 1.25, rect.width / 2, rect.height / 2);
+    };
+    document.getElementById('zoom-out').onclick = () => {
+      const rect = container.getBoundingClientRect();
+      setZoom(scale / 1.25, rect.width / 2, rect.height / 2);
+    };
+    document.getElementById('zoom-fit').onclick = fitToView;
+
+    document.getElementById('toggle-direction').onclick = async () => {
+      const btn = document.getElementById('toggle-direction');
+      const mermaidEl = wrapper.querySelector('.mermaid');
+      const isLR = mermaidRaw.startsWith('graph LR');
+      mermaidRaw = isLR ? mermaidRaw.replace(/^graph LR/, 'graph TD') : mermaidRaw.replace(/^graph TD/, 'graph LR');
+      btn.textContent = isLR ? 'LR' : 'TD';
+      mermaidEl.removeAttribute('data-processed');
+      mermaidEl.innerHTML = mermaidRaw;
+      wrapper.classList.remove('ready');
+      scale = 1; panX = 0; panY = 0; applyTransform();
+      await mermaid.run({ nodes: [mermaidEl] });
+      requestAnimationFrame(() => { fitToView(); wrapper.classList.add('ready'); });
+    };
+
+    document.getElementById('download-png').onclick = () => {
+      const svg = wrapper.querySelector('svg');
+      if (!svg) return;
+      const svgData = new XMLSerializer().serializeToString(svg);
+      const canvas = document.createElement('canvas');
+      const scale = 4;
+      const bb = svg.viewBox.baseVal;
+      const sw = bb.width || svg.clientWidth;
+      const sh = bb.height || svg.clientHeight;
+      canvas.width = sw * scale;
+      canvas.height = sh * scale;
+      const ctx = canvas.getContext('2d');
+      const img = new Image();
+      img.onload = () => {
+        ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+        const a = document.createElement('a');
+        a.download = ${scriptJson(JSON.stringify(`${title}-ldfviz.png`))};
+        a.href = canvas.toDataURL('image/png');
+        a.click();
+      };
+      img.src = 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(svgData);
+    };
+
+    function getMermaidSource() { return mermaidRaw; }
+    const jsonSource = document.getElementById('graph-json').textContent;
+    const sourcePanel = document.getElementById('source-panel');
+    const sourceContent = document.getElementById('source-content');
+    let activeTab = 'mermaid';
+
+    document.querySelectorAll('.source-tabs button').forEach(btn => {
+      btn.onclick = () => {
+        document.querySelector('.source-tabs .active').classList.remove('active');
+        btn.classList.add('active');
+        activeTab = btn.dataset.tab;
+        sourceContent.textContent = activeTab === 'mermaid' ? getMermaidSource() : jsonSource;
+      };
+    });
+
+    const toggleBtn = document.getElementById('toggle-source');
+    toggleBtn.onclick = () => {
+      const visible = sourcePanel.classList.toggle('visible');
+      toggleBtn.textContent = visible ? 'Diagram' : 'Source';
+      if (visible) sourceContent.textContent = activeTab === 'mermaid' ? getMermaidSource() : jsonSource;
+    };
+
+    setTimeout(() => {
+      fitToView();
+      wrapper.classList.add('ready');
+    }, 500);
+  </script>
+</body>
+</html>`
+}
+
+function embedScriptUrl(): string {
+  // Pinned so a new Autovisualizer release can't change pages; 0.9.0 is the first with flowchart shapes.
+  return process.env.AUTOVISUALIZER_EMBED_URL
+    ?? 'https://cdn.jsdelivr.net/npm/autovisualizer@0.9.0/public/embed/embed.js'
+}
+
+/** Self-contained HTML that draws MachineJSON with Autovisualizer (no worker). */
+function buildAutovisualizerHtml(machineJson: string, title: string): string {
+  const escaped = scriptJson(machineJson)
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>${escapeHtml(title)} - AWS Lambda Durable Functions Visualizer</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    html, body { height: 100%; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: #0f172a;
+      color: #e2e8f0;
+      display: flex;
+      flex-direction: column;
+    }
+    header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 1rem 1.5rem;
+      border-bottom: 1px solid #1e293b;
+      flex-shrink: 0;
+    }
+    h1 { font-size: 1.1rem; font-weight: 500; color: #94a3b8; }
+    h1 span { color: #e2e8f0; }
+    header a { color: #64748b; font-size: 0.8rem; text-decoration: none; }
+    header a:hover { color: #e2e8f0; }
+    auto-visualizer {
+      flex: 1;
+      min-height: 0;
+      display: block;
+      --autoviz-canvas: #0f172a;
+    }
+  </style>
+  <script type="module" src="${embedScriptUrl()}"></script>
+</head>
+<body>
+  <header>
+    <h1>ldfviz: <span>${escapeHtml(title)}</span></h1>
+    <a href="https://github.com/jagreehal/autovisualizer" target="_blank">Autovisualizer</a>
+  </header>
+  <script type="application/json" id="workflow">${escaped}</script>
+  <auto-visualizer definition="#workflow" theme="dark" caption="${escapeHtml(title)} workflow" style="height:100%"></auto-visualizer>
+</body>
+</html>`
+}
+
+function writeOutput(content: string, outputPath?: string): void {
+  if (outputPath) {
+    writeFileSync(resolve(outputPath), content)
+    console.error(`Wrote: ${resolve(outputPath)}`)
+  } else {
+    console.log(content)
+  }
+}
+
+function openMachineJson(machineJson: string, title: string): string {
+  const tempDir = getTempDir()
+  const stamp = Date.now()
+  const jsonPath = resolve(tempDir, `ldfviz-${stamp}.machine.json`)
+  const htmlPath = resolve(tempDir, `ldfviz-${stamp}.html`)
+  writeFileSync(jsonPath, machineJson)
+  writeFileSync(htmlPath, buildAutovisualizerHtml(machineJson, title))
+
+  const avUrl = process.env.AUTOVISUALIZER_URL
+  if (avUrl) {
+    // The app opens files itself, so point it at the MachineJSON instead of the embed page.
+    openInBrowser(avUrl)
+    console.error(`Opened: ${avUrl} (File → Open ${jsonPath})`)
+  } else {
+    openInBrowser(htmlPath)
+    console.error(`Opened: ${htmlPath}`)
+  }
+  console.error(`MachineJSON: ${jsonPath}`)
+  return jsonPath
+}
+
+const program = new Command()
+  .name('ldfviz')
+  .description('Visualize AWS Lambda Durable Functions workflows as Autovisualizer MachineJSON (or Mermaid)')
+  .version(version)
+  .argument('<file>', 'Path to a file containing a durable function handler')
+  .option('-d, --direction <dir>', 'Mermaid graph direction: TD (top-down) or LR (left-right)', 'TD')
+  .option('-n, --name <name>', 'Override the workflow name')
+  .option('--mermaid', 'Output Mermaid flowchart syntax instead of MachineJSON')
+  .option('--graph', 'Output the raw workflow graph as JSON')
+  .option('--json', 'Alias for MachineJSON output (the default)')
+  .option('-o, --output <file>', 'Write output to a file instead of stdout')
+  .option('--open', 'Open the diagram in your browser (Autovisualizer embed, or Mermaid HTML with --mermaid)')
+  .action((file: string, options: {
+    direction: string
+    name?: string
+    mermaid?: boolean
+    graph?: boolean
+    json?: boolean
+    output?: string
+    open?: boolean
+  }) => {
+    const filePath = resolve(file)
+
+    try {
+      const graph = parseFile(filePath, { name: options.name })
+      const title = options.name
+        ?? basename(filePath, extname(filePath))
+
+      if (options.graph) {
+        writeOutput(JSON.stringify(graph, null, 2), options.output)
+        return
+      }
+
+      if (options.mermaid) {
+        const direction = options.direction as 'TD' | 'LR'
+        const mermaid = renderMermaid(graph, { direction })
+        if (options.open) {
+          const html = buildHtml(mermaid, title, JSON.stringify(graph, null, 2))
+          const tmpPath = resolve(getTempDir(), `ldfviz-${Date.now()}.html`)
+          writeFileSync(tmpPath, html)
+          openInBrowser(tmpPath)
+          console.error(`Opened: ${tmpPath}`)
+          if (options.output) writeOutput(mermaid, options.output)
+        } else {
+          writeOutput(mermaid, options.output)
+        }
+        return
+      }
+
+      // Default: Autovisualizer MachineJSON
+      const machineJson = renderMachineJsonString(graph)
+      if (options.open) {
+        openMachineJson(machineJson, title)
+        if (options.output) writeOutput(machineJson, options.output)
+      } else {
+        writeOutput(machineJson, options.output)
+      }
+    } catch (err) {
+      console.error(`Error: ${err instanceof Error ? err.message : String(err)}`)
+      process.exit(1)
+    }
+  })
+
+program.parse()
